@@ -11,5 +11,5 @@ This module allows users to:
 
 ### 🚀 Run Locally
 ```bash
-pip install newspaper3k feedparser lxml_html_clean
+pip install requests feedparser newspaper3k yfinance transformers torch vaderSentiment pytz
 python news_scraper.py
