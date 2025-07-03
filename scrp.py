@@ -1,14 +1,50 @@
+import requests
 import feedparser
 from newspaper import Article
 from datetime import datetime
 import pytz
 import yfinance as yf
-from textblob import TextBlob
+from transformers import BertTokenizer, BertForSequenceClassification, pipeline
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import os
 
-def fetch_google_news_links(query, max_articles=5):
+# ---------------------------
+# CONFIG
+# ---------------------------
+FINNHUB_API_KEY = "d1ilckhr01qhbuvqnvk0d1ilckhr01qhbuvqnvkg"  # <<<< PUT YOUR API KEY HERE
+NIFTY_THRESHOLD = 20000
+STOCKS_FILE = "stocks.txt"  # Each line: one company name
+
+# ---------------------------
+# LOAD MODELS
+# ---------------------------
+model_name = "yiyanghkust/finbert-tone"
+tokenizer = BertTokenizer.from_pretrained(model_name)
+model = BertForSequenceClassification.from_pretrained(model_name)
+finbert = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
+
+vader = SentimentIntensityAnalyzer()
+
+# ---------------------------
+# HELPERS
+# ---------------------------
+def search_symbol_finnhub(company_name):
+    url = f"https://finnhub.io/api/v1/search?q={company_name}&token={FINNHUB_API_KEY}"
+    response = requests.get(url)
+    data = response.json()
+    if data.get("count", 0) > 0:
+        top_result = data["result"][0]
+        symbol = top_result["symbol"]
+        description = top_result["description"]
+        return symbol, description
+    return None, None
+
+def fetch_news_sentiments(query, max_articles=5):
     feed_url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}"
     feed = feedparser.parse(feed_url)
-    articles = []
+
+    finbert_sentiments = []
+    vader_sentiments = []
 
     for entry in feed.entries[:max_articles]:
         article_url = entry.link
@@ -16,23 +52,50 @@ def fetch_google_news_links(query, max_articles=5):
         try:
             article.download()
             article.parse()
-            # Sentiment
-            summary_text = article.text[:400]
-            blob = TextBlob(summary_text)
-            polarity = blob.sentiment.polarity  # -1 to 1
-            sentiment = "Positive" if polarity > 0 else "Negative" if polarity < 0 else "Neutral"
-            articles.append({
-                "title": article.title,
-                "summary": summary_text + "...",
-                "source": entry.get("source", {}).get("title", "Unknown"),
-                "published": entry.published,
-                "link": article_url,
-                "sentiment": sentiment,
-                "polarity": polarity
-            })
+
+            text = f"{article.title}. {article.text[:300]}"
+            if not article.text.strip():
+                text = f"{article.title}. {entry.get('description', '')}"
+
+            finbert_result = finbert(text)[0]
+            finbert_sentiments.append(finbert_result['label'])
+
+            vs = vader.polarity_scores(text)
+            vader_label = "positive" if vs['compound'] > 0.05 else "negative" if vs['compound'] < -0.05 else "neutral"
+            vader_sentiments.append(vader_label)
+
         except Exception as e:
-            print(f"Error parsing article: {article_url}\n{e}")
-    return articles
+            print(f"Error fetching article: {e}")
+
+    return finbert_sentiments, vader_sentiments
+
+def analyze_sentiments(finbert_list, vader_list):
+    def count(labels):
+        counts = {"positive": 0, "negative": 0, "neutral": 0}
+        for s in labels:
+            label = s.lower()
+            if label in counts:
+                counts[label] += 1
+        return counts
+
+    finbert_counts = count(finbert_list)
+    vader_counts = count(vader_list)
+
+    def majority(counts):
+        if counts["positive"] > counts["negative"] and counts["positive"] > counts["neutral"]:
+            return "positive"
+        elif counts["negative"] > counts["positive"] and counts["negative"] > counts["neutral"]:
+            return "negative"
+        else:
+            return "neutral/mixed"
+
+    finbert_majority = majority(finbert_counts)
+    vader_majority = majority(vader_counts)
+
+    report = []
+    report.append(f"📊 FinBERT: {finbert_majority.upper()} ({finbert_counts})")
+    report.append(f"📰 VADER: {vader_majority.upper()} ({vader_counts})")
+    return "\n".join(report)
 
 def get_nifty_info():
     nifty = yf.Ticker("^NSEI")
@@ -44,41 +107,82 @@ def get_nifty_info():
         "changePercent": info.get("regularMarketChangePercent")
     }
 
-def check_nifty_alert(current_price, threshold):
+def check_nifty_alert(current_price):
+    summary = "\n📌 What is the NIFTY Index?\n"
+    summary += "NIFTY 50 is an index representing the top 50 companies listed on the National Stock Exchange (NSE) of India, chosen based on market capitalisation and liquidity.\n"
+
     if current_price is None:
-        print("Could not fetch NIFTY data.")
-        return
+        summary += "\n⚠️ Could not fetch NIFTY data.\n"
+        return summary
 
-    print("\n📌 What is the NIFTY Index?")
-    print("NIFTY 50 is an index representing the top 50 companies listed on the National Stock Exchange (NSE) of India, chosen based on market capitalisation and liquidity.\n")
-
-    if current_price > threshold:
-        print(f"🚨 NIFTY Alert: NIFTY is ABOVE {threshold}! Current: {current_price}")
+    if current_price > NIFTY_THRESHOLD:
+        summary += f"\n🚨 NIFTY Alert: Above {NIFTY_THRESHOLD}! Current: {current_price}\n"
     else:
-        print(f"✅ NIFTY Update: NIFTY is below {threshold}. Current: {current_price}")
+        summary += f"\n✅ NIFTY: Below {NIFTY_THRESHOLD}. Current: {current_price}\n"
 
+    return summary
+
+# ---------------------------
+# MAIN EXECUTION
+# ---------------------------
 if __name__ == "__main__":
-    # Get local time with timezone
     tz = pytz.timezone("Asia/Kolkata")
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    stock_name = input("Enter stock or company name: ")
-    print(f"\nFetching news for: {stock_name}...")
-    news_articles = fetch_google_news_links(stock_name, max_articles=7)
+    print("📌 Choose:")
+    print("1. Run for **one** company name")
+    print("2. Run for **multiple** from `stocks.txt`")
 
-    print("\n📰 Top Headlines + Sentiment:\n")
-    for idx, article in enumerate(news_articles, start=1):
-        print(f"{idx}. {article['title']}")
-        print(f"   Published: {article['published']}")
-        print(f"   Source: {article['source']}")
-        print(f"   Summary: {article['summary'][:250]}...")
-        print(f"   Sentiment: {article['sentiment']} (Polarity: {article['polarity']:.2f})")
-        print(f"   Link: {article['link']}\n")
+    choice = input("Enter 1 or 2: ").strip()
 
-    print("\n📈 Checking NIFTY Index...\n")
+    if choice == "1":
+        companies = [input("Enter company name: ").strip()]
+    else:
+        with open(STOCKS_FILE, "r") as f:
+            companies = [line.strip() for line in f if line.strip()]
+
+    print(f"\n🔍 Running for: {companies}\n")
+
+    # Get NIFTY once
     nifty_data = get_nifty_info()
+    nifty_summary = check_nifty_alert(nifty_data['currentPrice'])
 
-    check_nifty_alert(nifty_data['currentPrice'], threshold=20000)
+    os.makedirs("reports", exist_ok=True)
 
-    print(f"\n🕒 Last Updated: {now}")
+    for company in companies:
+        symbol, description = search_symbol_finnhub(company)
+
+        if not symbol:
+            print(f"⚠️ Could not auto-find ticker for: {company}")
+            manual_symbol = input("🔍 Enter exact NSE/BSE ticker symbol manually (or press Enter to skip): ").strip().upper()
+            if manual_symbol:
+                symbol = manual_symbol
+                description = f"Manual ticker input for {company}"
+            else:
+                print(f"❌ Skipping {company} — no valid ticker.")
+                continue
+
+        stock = yf.Ticker(symbol)
+        if not stock.info or not stock.info.get("regularMarketPrice"):
+            print(f"❌ No price data for ticker: {symbol}")
+            continue
+
+        finbert_sents, vader_sents = fetch_news_sentiments(company, max_articles=7)
+        sentiment_report = analyze_sentiments(finbert_sents, vader_sents)
+
+        report = []
+        report.append(f"📄 REPORT for: {company} ({symbol}) - {description}")
+        report.append(f"🕒 Last Updated: {now}\n")
+        report.append(sentiment_report)
+        report.append(nifty_summary)
+
+        report_text = "\n".join(report)
+        print("\n" + report_text + "\n")
+
+        filename = f"reports/{company}_{symbol}_{now[:10]}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(report_text)
+
+    print("\n✅ All reports saved to `reports/` folder.\n")
+
 
